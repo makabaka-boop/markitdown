@@ -87,7 +87,22 @@ class DocxConverter(HtmlConverter):
                 _dependency_exc_info[2]
             )
 
-        pre_process_stream = pre_process_docx(file_stream)
+        # ``track_changes="reject"`` converts the document as it read before
+        # the tracked revisions: inserted content is dropped, deleted content
+        # restored, and moved content kept once at its original location.
+        # Any other value (including None, the default) converts the document
+        # as-is, preserving the existing output.
+        track_changes = kwargs.get("track_changes")
+        if track_changes is not None and track_changes != "reject":
+            raise ValueError(
+                f"Unsupported value for the track_changes option: "
+                f"{track_changes!r}. The only supported value is 'reject', "
+                "which converts the pre-revision content."
+            )
+
+        pre_process_stream = pre_process_docx(
+            file_stream, reject_tracked_changes=track_changes == "reject"
+        )
 
         caller_style_map = kwargs.get("style_map")
         embedded_style_map = _read_embedded_style_map(pre_process_stream)

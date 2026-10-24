@@ -1,12 +1,17 @@
+import re
 import struct
 import zipfile
 from io import BytesIO
-from typing import BinaryIO
+from typing import Any, BinaryIO
 from xml.etree import ElementTree as ET
 
 from bs4 import BeautifulSoup, Tag
 
 from .math.omml import OMML_NS, oMath2Latex
+
+WORD_PROCESSINGML_NAMESPACE = (
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+)
 
 MATH_ROOT_TEMPLATE = "".join(
     (
@@ -224,7 +229,7 @@ def _pre_process_styles(content: bytes) -> bytes:
     """
     from lxml import etree
 
-    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    namespace = f"{{{WORD_PROCESSINGML_NAMESPACE}}}"
     parser = etree.XMLParser(resolve_entities=False, no_network=True)
     root = etree.fromstring(content, parser=parser)
     changed = False
@@ -247,7 +252,252 @@ def _pre_process_styles(content: bytes) -> bytes:
     return etree.tostring(root.getroottree(), encoding="utf-8", xml_declaration=True)
 
 
-def pre_process_docx(input_docx: BinaryIO) -> BinaryIO:
+# Opening revision tags regardless of the namespace prefix used (Word writes
+# "w:", but conforming generators may bind the namespace differently). Text
+# containing the escaped sequence "&lt;w:ins" does not match.
+_REVISION_TAG_PATTERN = re.compile(
+    rb"<(?:[A-Za-z_][\w.-]*:)?" rb"(?:ins|del|moveFrom|moveTo)(?:\s|/|>)"
+)
+
+# Revision markers that can appear between paragraphs when locating the
+# paragraph that preceded an inserted paragraph mark. They carry no content of
+# their own, so crossing them does not change where the merged text belongs.
+_TRANSPARENT_PARAGRAPH_MARKERS = frozenset(
+    (
+        "bookmarkStart",
+        "bookmarkEnd",
+        "proofErr",
+        "commentRangeStart",
+        "commentRangeEnd",
+        "moveFromRangeStart",
+        "moveFromRangeEnd",
+        "moveToRangeStart",
+        "moveToRangeEnd",
+    )
+)
+
+
+def _wordprocessingml_tag(name: str) -> str:
+    return f"{{{WORD_PROCESSINGML_NAMESPACE}}}{name}"
+
+
+def _unwrap_element(element: Any) -> None:
+    """Replace an element with its children, preserving document order."""
+    parent = element.getparent()
+    if parent is None:
+        return
+    index = parent.index(element)
+    for child in list(element):
+        parent.insert(index, child)
+        index += 1
+    parent.remove(element)
+
+
+def _remove_moved_to_ranges(root: Any) -> None:
+    """Remove content bracketed by ``w:moveToRangeStart``/``w:moveToRangeEnd``.
+
+    A move destination may be marked with a range rather than ``w:moveTo``
+    wrappers. The pre-revision document has nothing at the destination, so the
+    markers and everything between them is dropped. Only ranges whose start and
+    end share a parent are handled (the typical case for moved runs); moved
+    paragraphs additionally carry paragraph-mark revisions handled separately.
+    """
+    move_to_range_start = _wordprocessingml_tag("moveToRangeStart")
+    move_to_range_end = _wordprocessingml_tag("moveToRangeEnd")
+    revision_id_attribute = _wordprocessingml_tag("id")
+
+    for start in list(root.iter(move_to_range_start)):
+        parent = start.getparent()
+        if parent is None:
+            continue
+        revision_id = start.get(revision_id_attribute)
+        end = None
+        for sibling in start.itersiblings():
+            if (
+                sibling.tag == move_to_range_end
+                and sibling.get(revision_id_attribute) == revision_id
+            ):
+                end = sibling
+                break
+        if end is None:
+            # Malformed range: drop the orphan marker rather than leave a
+            # revision element in the output.
+            parent.remove(start)
+            continue
+        doomed = [start]
+        node = start.getnext()
+        while node is not None and node is not end:
+            doomed.append(node)
+            node = node.getnext()
+        doomed.append(end)
+        for node in doomed:
+            node.getparent().remove(node)
+
+
+def _reject_inserted_paragraph_mark(paragraph: Any) -> None:
+    """Reject an inserted paragraph mark by merging the paragraph into its predecessor.
+
+    The inserted mark split one original paragraph in two, so the paragraph's
+    content is moved into the preceding paragraph and the split paragraph is
+    removed. If no preceding paragraph is available (malformed input), the
+    marker is stripped and the paragraph is left in place.
+    """
+    parent = paragraph.getparent()
+    if parent is None:
+        return
+
+    paragraph_tag = _wordprocessingml_tag("p")
+    transparent = {
+        _wordprocessingml_tag(name) for name in _TRANSPARENT_PARAGRAPH_MARKERS
+    }
+    previous = paragraph.getprevious()
+    while previous is not None and previous.tag in transparent:
+        previous = previous.getprevious()
+
+    if previous is None or previous.tag != paragraph_tag:
+        marker = paragraph.find(
+            f"{_wordprocessingml_tag('pPr')}/{_wordprocessingml_tag('rPr')}/"
+            f"{_wordprocessingml_tag('ins')}"
+        )
+        if marker is not None:
+            marker.getparent().remove(marker)
+        return
+
+    paragraph_properties = _wordprocessingml_tag("pPr")
+    for child in list(paragraph):
+        if child.tag != paragraph_properties:
+            previous.append(child)
+    parent.remove(paragraph)
+
+
+def _pre_process_reject_tracked_changes(content: bytes) -> bytes:
+    """Rewrite tracked revisions so the DOCX reflects its pre-revision text.
+
+    Equivalent to rejecting all tracked changes before conversion:
+
+    * inserted runs (``w:ins``) are removed;
+    * deleted runs (``w:del``) are restored, with ``w:delText`` turned back
+      into regular ``w:t`` text;
+    * moved content is kept at its original location (``w:moveFrom``) and
+      removed from its destination (``w:moveTo``), so it appears exactly once;
+    * inserted paragraph marks merge their paragraph back into the preceding
+      paragraph, while deleted paragraph marks keep both paragraphs separate;
+    * inserted table rows are removed and deleted table rows are restored.
+
+    Only text and paragraph boundaries in the main document body and table
+    cells, plus whole table-row revisions, are in scope. Formatting revisions
+    (``w:rPrChange``, ``w:pPrChange`` and similar) are left untouched, so the
+    current heading, list, emphasis, link, table and equation formatting is
+    kept. The transformation operates on an in-memory copy and never modifies
+    the input file.
+    """
+    # Skip the XML round-trip for documents that contain no revision tags.
+    if _REVISION_TAG_PATTERN.search(content) is None:
+        return content
+
+    from lxml import etree
+
+    parser = etree.XMLParser(resolve_entities=False, no_network=True)
+    root = etree.fromstring(content, parser=parser)
+
+    paragraph_tag = _wordprocessingml_tag("p")
+    run_properties_tag = _wordprocessingml_tag("rPr")
+    table_row_tag = _wordprocessingml_tag("tr")
+    table_row_properties_tag = _wordprocessingml_tag("trPr")
+
+    # Whole table-row revisions: an inserted row disappears, while a deleted
+    # row is restored by stripping its revision marker.
+    for row in list(root.iter(table_row_tag)):
+        row_properties = row.find(table_row_properties_tag)
+        if row_properties is None:
+            continue
+        if row_properties.find(_wordprocessingml_tag("ins")) is not None:
+            row_parent = row.getparent()
+            if row_parent is not None:
+                row_parent.remove(row)
+        else:
+            deleted_row_marker = row_properties.find(_wordprocessingml_tag("del"))
+            if deleted_row_marker is not None:
+                row_properties.remove(deleted_row_marker)
+
+    # Paragraph-mark revisions live in pPr/rPr.
+    paragraphs_to_remove = []
+    paragraphs_to_merge = []
+    for paragraph in list(root.iter(paragraph_tag)):
+        mark_run_properties = paragraph.find(
+            f"{_wordprocessingml_tag('pPr')}/{run_properties_tag}"
+        )
+        if mark_run_properties is None:
+            continue
+        for marker_name in ("ins", "del", "moveFrom", "moveTo"):
+            marker = mark_run_properties.find(_wordprocessingml_tag(marker_name))
+            if marker is None:
+                continue
+            if marker_name == "moveTo":
+                # Destination of a moved paragraph: it did not exist here
+                # before the revision, so the whole paragraph is dropped.
+                paragraphs_to_remove.append(paragraph)
+            elif marker_name == "ins":
+                # New paragraph mark: merge back into the preceding paragraph.
+                paragraphs_to_merge.append(paragraph)
+            else:
+                # "del" joined two paragraphs in the revised view; rejecting
+                # keeps them separate. "moveFrom" marks the source paragraph,
+                # which stays where it was. In both cases only the marker goes.
+                mark_run_properties.remove(marker)
+            break
+
+    for paragraph in paragraphs_to_remove:
+        paragraph_parent = paragraph.getparent()
+        if paragraph_parent is not None:
+            paragraph_parent.remove(paragraph)
+    for paragraph in paragraphs_to_merge:
+        _reject_inserted_paragraph_mark(paragraph)
+
+    structural_markers = {run_properties_tag, table_row_properties_tag}
+
+    # Inserted content and move destinations are discarded. Markers nested in
+    # rPr/trPr are paragraph/row revisions already handled above.
+    for marker_name in ("ins", "moveTo"):
+        for element in list(root.iter(_wordprocessingml_tag(marker_name))):
+            parent = element.getparent()
+            if parent is None or parent.tag in structural_markers:
+                continue
+            parent.remove(element)
+
+    # Deleted content and move sources are restored in place.
+    for marker_name in ("del", "moveFrom"):
+        for element in list(root.iter(_wordprocessingml_tag(marker_name))):
+            parent = element.getparent()
+            if parent is None or parent.tag in structural_markers:
+                continue
+            _unwrap_element(element)
+
+    # Resolve move range markers: drop move-to ranges (content already handled
+    # for move-to paragraphs) and strip any remaining range boundary markers.
+    _remove_moved_to_ranges(root)
+    for marker_name in (
+        "moveToRangeStart",
+        "moveToRangeEnd",
+        "moveFromRangeStart",
+        "moveFromRangeEnd",
+    ):
+        for element in list(root.iter(_wordprocessingml_tag(marker_name))):
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
+
+    # Deleted and moved-from runs store their text in w:delText instead of
+    # w:t; restore it as ordinary text now that the revision wrappers are gone.
+    for deleted_text in list(root.iter(_wordprocessingml_tag("delText"))):
+        deleted_text.tag = _wordprocessingml_tag("t")
+
+    return etree.tostring(root.getroottree(), encoding="utf-8", xml_declaration=True)
+
+
+def pre_process_docx(
+    input_docx: BinaryIO, *, reject_tracked_changes: bool = False
+) -> BinaryIO:
     """
     Pre-processes a DOCX file with provided steps.
 
@@ -257,6 +507,11 @@ def pre_process_docx(input_docx: BinaryIO) -> BinaryIO:
 
     Args:
         input_docx (BinaryIO): A binary input stream representing the DOCX file.
+        reject_tracked_changes (bool): When True, tracked revisions in the main
+            document are rejected before conversion, yielding the pre-revision
+            text: insertions are removed, deletions restored, and moved content
+            kept at its source. Formatting revisions are not reverted. When
+            False (the default), the document is converted as-is.
 
     Returns:
         BinaryIO: A binary output stream representing the processed DOCX file.
@@ -264,10 +519,14 @@ def pre_process_docx(input_docx: BinaryIO) -> BinaryIO:
     # Fix ZIP filename casing mismatch before any processing
     input_docx = _fix_zip_filename_casing(input_docx)
 
+    document_steps = [_pre_process_strike, _pre_process_math]
+    if reject_tracked_changes:
+        document_steps.insert(0, _pre_process_reject_tracked_changes)
+
     output_docx = BytesIO()
     # The pre-processing steps to apply to each file in the .docx
     pre_process_enable_files = {
-        "word/document.xml": (_pre_process_strike, _pre_process_math),
+        "word/document.xml": tuple(document_steps),
         "word/footnotes.xml": (_pre_process_strike, _pre_process_math),
         "word/endnotes.xml": (_pre_process_strike, _pre_process_math),
         "word/styles.xml": (_pre_process_styles,),

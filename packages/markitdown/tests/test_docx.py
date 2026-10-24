@@ -32,7 +32,11 @@ from markitdown.converter_utils.docx.math.latex_dict import (
     T,
 )
 from markitdown.converter_utils.docx.math.omml import OMML_NS, load_string, oMath2Latex
-from markitdown.converter_utils.docx.pre_process import _pre_process_styles
+from markitdown.converter_utils.docx.pre_process import (
+    _pre_process_reject_tracked_changes,
+    _pre_process_styles,
+    pre_process_docx,
+)
 from markitdown.converters import DocxConverter, HtmlConverter, _docx_converter
 
 # Math functions
@@ -1480,6 +1484,389 @@ def test_convert_docx_with_style_missing_type(tmp_path):
         in result.markdown
     )
     assert "# Abstract" in result.markdown
+
+
+# Tracked changes: pre-revision content mode (track_changes="reject")
+#
+# Mammoth renders the accepted-revision view: w:ins/w:moveTo content is shown,
+# w:del/w:moveFrom content is hidden, deleted paragraph marks merge paragraphs,
+# and deleted table rows are skipped. With track_changes="reject" the DOCX is
+# pre-processed as though every revision were rejected, yielding the text as it
+# read before review.
+
+
+_REVISION_ATTRS = 'w:id="1" w:author="reviewer" w:date="2026-01-01T00:00:00Z"'
+
+
+def _revised_run(text: str, revision: str) -> str:
+    if revision == "ins":
+        return (
+            f'<w:ins {_REVISION_ATTRS}><w:r><w:t xml:space="preserve">'
+            f"{text}</w:t></w:r></w:ins>"
+        )
+    return (
+        f'<w:del {_REVISION_ATTRS}><w:r><w:delText xml:space="preserve">'
+        f"{text}</w:delText></w:r></w:del>"
+    )
+
+
+def _convert_revisions(body: str, *, track_changes: Optional[str] = None, **options):
+    options = {"track_changes": track_changes, **options}
+    return DocxConverter().convert(_docx(body), _INFO, **options).markdown
+
+
+def _markdown_paragraphs(markdown: str) -> list[str]:
+    return [paragraph for paragraph in markdown.split("\n\n") if paragraph]
+
+
+def test_reject_tracked_changes_handles_default_namespace_prefix() -> None:
+    # A conforming generator may bind WordprocessingML as the default namespace,
+    # writing "<ins>" instead of "<w:ins>". Matching is namespace-URI based.
+    content = (
+        '<document xmlns="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<body><p>"
+        "<r><t>keep-</t></r>"
+        '<ins w:id="1" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<r><t>gone</t></r></ins>"
+        "<del w:id=\"2\" xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        "<r><delText>restored</delText></r></del>"
+        "</p></body></document>"
+    ).encode("utf-8")
+
+    transformed = etree.fromstring(_pre_process_reject_tracked_changes(content))
+    text = "".join(transformed.itertext())
+
+    assert "gone" not in text
+    assert "keep-restored" == text
+
+
+def test_reject_tracked_changes_skips_documents_without_revisions() -> None:
+    # Escaped revision-looking text must not trigger (or be altered by) the
+    # transform, and the fast path returns the exact original bytes.
+    content = (
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:body><w:p><w:r><w:t xml:space="preserve">'
+        "literal &lt;w:ins&gt; markup</w:t></w:r></w:p></w:body></w:document>"
+    ).encode("utf-8")
+
+    assert _pre_process_reject_tracked_changes(content) == content
+
+
+def test_rejected_insertions_are_dropped_and_deletions_restored() -> None:
+    body = _paragraph(
+        _text("keep-") + _revised_run("NEW", "ins") + _revised_run("OLD", "del")
+    )
+
+    default = _convert_revisions(body)
+    rejected = _convert_revisions(body, track_changes="reject")
+
+    assert default == "keep-NEW"
+    assert rejected == "keep-OLD"
+
+
+def test_reject_mode_is_opt_in_and_leaves_default_output_unchanged() -> None:
+    body = _paragraph(_text("keep-") + _revised_run("NEW", "ins"))
+    stream = _docx(body)
+
+    without_option = DocxConverter().convert(stream, _INFO).markdown
+    explicit_none = (
+        DocxConverter().convert(_docx(body), _INFO, track_changes=None).markdown
+    )
+
+    assert without_option == explicit_none == "keep-NEW"
+
+
+def test_reject_mode_does_not_modify_the_input_stream() -> None:
+    body = _paragraph(_text("stable ") + _revised_run("inserted", "ins"))
+    stream = _docx(body)
+    original = stream.getvalue()
+
+    DocxConverter().convert(stream, _INFO, track_changes="reject")
+
+    assert not stream.closed
+    assert stream.getvalue() == original
+
+
+def test_unknown_track_changes_value_is_rejected() -> None:
+    stream = _docx(_paragraph(_text("text")))
+    with pytest.raises(ValueError, match="track_changes"):
+        DocxConverter().convert(stream, _INFO, track_changes="accept")
+
+
+def test_reject_mode_works_through_the_dispatcher() -> None:
+    body = _paragraph(
+        _text("keep-") + _revised_run("gone", "ins") + _revised_run("kept", "del")
+    )
+
+    result = MarkItDown().convert_stream(
+        _docx(body), stream_info=_INFO, track_changes="reject"
+    )
+
+    assert result.markdown == "keep-kept"
+
+
+def test_rejected_moved_runs_appear_once_at_their_source() -> None:
+    source = (
+        "<w:p>"
+        f"<w:moveFromRangeStart {_REVISION_ATTRS}/>"
+        f"<w:moveFrom {_REVISION_ATTRS}><w:r><w:delText>WANDER</w:delText></w:r></w:moveFrom>"
+        '<w:moveFromRangeEnd w:id="1"/>'
+        "<w:r><w:t>-rest</w:t></w:r>"
+        "</w:p>"
+    )
+    destination = (
+        "<w:p>"
+        "<w:r><w:t>lead-</w:t></w:r>"
+        f"<w:moveToRangeStart {_REVISION_ATTRS}/>"
+        f"<w:moveTo {_REVISION_ATTRS}><w:r><w:t>WANDER</w:t></w:r></w:moveTo>"
+        '<w:moveToRangeEnd w:id="1"/>'
+        "<w:r><w:t>-tail</w:t></w:r>"
+        "</w:p>"
+    )
+
+    default = _convert_revisions(source + destination)
+    rejected = _convert_revisions(source + destination, track_changes="reject")
+
+    # By default the source is empty (moveFrom is hidden) and only the
+    # destination carries the text; rejecting restores the source and empties
+    # the destination, so the text appears exactly once, at its old location.
+    assert _markdown_paragraphs(default) == ["-rest", "lead-WANDER-tail"]
+    assert _markdown_paragraphs(rejected) == ["WANDER-rest", "lead--tail"]
+    assert rejected.count("WANDER") == 1
+
+
+def test_rejected_moved_paragraph_is_kept_at_source_only() -> None:
+    before = _paragraph(_text("BEFORE"))
+    source = (
+        "<w:p><w:pPr><w:rPr>"
+        f"<w:moveFrom {_REVISION_ATTRS}/>"
+        "</w:rPr></w:pPr>"
+        f"<w:moveFrom {_REVISION_ATTRS}><w:r><w:delText>MOVED PARA</w:delText></w:r></w:moveFrom>"
+        "</w:p>"
+    )
+    destination = (
+        "<w:p><w:pPr><w:rPr>"
+        f"<w:moveTo {_REVISION_ATTRS}/>"
+        "</w:rPr></w:pPr>"
+        f"<w:moveTo {_REVISION_ATTRS}><w:r><w:t>MOVED PARA</w:t></w:r></w:moveTo>"
+        "</w:p>"
+    )
+    after = _paragraph(_text("AFTER"))
+
+    default = _convert_revisions(before + source + destination + after)
+    rejected = _convert_revisions(
+        before + source + destination + after, track_changes="reject"
+    )
+
+    # Default view: the source is an empty paragraph and only the destination
+    # carries the text. Rejecting restores the source and deletes the
+    # destination, so the order is identical, the text occurs once, and the
+    # rejected document has no empty paragraph left behind.
+    assert _markdown_paragraphs(default) == ["BEFORE", "MOVED PARA", "AFTER"]
+    assert _markdown_paragraphs(rejected) == ["BEFORE", "MOVED PARA", "AFTER"]
+    assert default.count("MOVED PARA") == rejected.count("MOVED PARA") == 1
+
+
+def test_inserted_paragraph_mark_is_merged_back() -> None:
+    body = (
+        _paragraph(_text("alpha")) + "<w:p><w:pPr><w:rPr>"
+        f"<w:ins {_REVISION_ATTRS}/>"
+        "</w:rPr></w:pPr>" + _text("beta") + "</w:p>"
+    )
+
+    default = _convert_revisions(body)
+    rejected = _convert_revisions(body, track_changes="reject")
+
+    assert _markdown_paragraphs(default) == ["alpha", "beta"]
+    assert rejected == "alphabeta"
+
+
+def test_consecutive_inserted_paragraph_marks_merge_into_one_paragraph() -> None:
+    body = "".join(
+        [
+            _paragraph(_text("alpha")),
+            "<w:p><w:pPr><w:rPr>"
+            f"<w:ins {_REVISION_ATTRS}/>"
+            "</w:rPr></w:pPr>" + _text("beta") + "</w:p>",
+            "<w:p><w:pPr><w:rPr>"
+            f"<w:ins {_REVISION_ATTRS}/>"
+            "</w:rPr></w:pPr>" + _text("gamma") + "</w:p>",
+        ]
+    )
+
+    rejected = _convert_revisions(body, track_changes="reject")
+
+    assert rejected == "alphabetagamma"
+
+
+def test_deleted_paragraph_mark_keeps_paragraphs_separate() -> None:
+    # Mammoth merges these in its default view (accept the deleted mark);
+    # rejecting the revision keeps the original paragraph boundary.
+    body = (
+        "<w:p><w:pPr><w:rPr>"
+        f"<w:del {_REVISION_ATTRS}/>"
+        "</w:rPr></w:pPr>" + _text("alpha") + "</w:p>" + _paragraph(_text("beta"))
+    )
+
+    default = _convert_revisions(body)
+    rejected = _convert_revisions(body, track_changes="reject")
+
+    assert default == "alphabeta"
+    assert _markdown_paragraphs(rejected) == ["alpha", "beta"]
+
+
+def _revision_table_body() -> str:
+    def cell(content: str) -> str:
+        return f"<w:tc><w:p>{content}</w:p></w:tc>"
+
+    def row(*cells: str, marker: str = "") -> str:
+        tr_properties = (
+            f"<w:trPr><w:{marker} {_REVISION_ATTRS}/></w:trPr>" if marker else ""
+        )
+        return f"<w:tr>{tr_properties}{''.join(cells)}</w:tr>"
+
+    return (
+        "<w:tbl><w:tblPr/>"
+        "<w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid>"
+        + row(cell(_text("stable ") + _revised_run("gone", "ins")), cell(_text("two")))
+        + row(cell(_text("newA")), cell(_text("newB")), marker="ins")
+        # Deleted rows may carry w:del-wrapped runs, plain runs, or both.
+        + row(
+            cell(_revised_run("oldA", "del")),
+            cell(_text("oldB")),
+            marker="del",
+        )
+        + "</w:tbl>"
+    )
+
+
+def test_rejected_table_rows_are_dropped_or_restored_with_cell_revisions() -> None:
+    body = _revision_table_body()
+
+    default = _convert_revisions(body)
+    rejected = _convert_revisions(body, track_changes="reject")
+
+    assert "newA" in default and "newB" in default
+    assert "oldA" not in default and "oldB" not in default
+    assert "gone" in default
+
+    assert "newA" not in rejected and "newB" not in rejected
+    assert "| oldA | oldB |" in rejected
+    # Cell-level text revisions are resolved within surviving rows.
+    assert "gone" not in rejected
+    assert "stable" in rejected
+
+
+def test_rejection_preserves_heading_emphasis_and_links() -> None:
+    heading = (
+        '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+        + _text("Title ")
+        + _revised_run("NEW", "ins")
+        + _revised_run("OLD", "del")
+        + "</w:p>"
+    )
+    inserted_bold = (
+        f"<w:ins {_REVISION_ATTRS}>"
+        "<w:r><w:rPr><w:b/></w:rPr><w:t>bold inserted</w:t></w:r>"
+        "</w:ins>"
+    )
+    deleted_italic = (
+        f"<w:del {_REVISION_ATTRS}>"
+        "<w:r><w:rPr><w:i/></w:rPr><w:delText>italic restored</w:delText></w:r>"
+        "</w:del>"
+    )
+    emphasis = _paragraph(inserted_bold + deleted_italic)
+    link = (
+        '<w:p><w:hyperlink w:anchor="target">'
+        + _text("anchor ")
+        + _revised_run("added", "ins")
+        + _revised_run("restored", "del")
+        + "</w:hyperlink></w:p>"
+    )
+
+    rejected = _convert_revisions(
+        heading + emphasis + link,
+        track_changes="reject",
+        style_map="p.Heading1 => h1",
+    )
+
+    assert "# Title OLD" in rejected
+    assert "NEW" not in rejected
+    assert "*italic restored*" in rejected
+    assert "bold inserted" not in rejected
+    assert "[anchor restored](#target)" in rejected
+    assert "added" not in rejected
+
+
+def test_rejection_preserves_equations_and_drops_revised_ones() -> None:
+    body = _paragraph(
+        _text("eq before ")
+        + f"<w:ins {_REVISION_ATTRS}><m:oMath><m:r><m:t>x+1</m:t></m:r></m:oMath></w:ins>"
+        + f"<w:del {_REVISION_ATTRS}><m:oMath><m:r><m:t>y+2</m:t></m:r></m:oMath></w:del>"
+        + _text(" eq after")
+    )
+
+    rejected = _convert_revisions(body, track_changes="reject")
+
+    assert "$y+2$" in rejected
+    assert "$x+1$" not in rejected
+
+
+def test_rejection_does_not_revert_formatting_revisions_or_list_membership() -> None:
+    content = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{WORD_NAMESPACE}">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:pStyle w:val="Heading1"/>
+        <w:pPrChange {_REVISION_ATTRS}><w:pPr><w:pStyle w:val="Normal"/></w:pPr></w:pPrChange>
+      </w:pPr>
+      <w:r>
+        <w:rPr><w:b/><w:rPrChange {_REVISION_ATTRS}><w:rPr/></w:rPrChange></w:rPr>
+        <w:t>styled</w:t>
+      </w:r>
+    </w:p>
+    <w:p>
+      <w:pPr>
+        <w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr>
+        <w:rPr><w:del {_REVISION_ATTRS}/></w:rPr>
+      </w:pPr>
+      <w:r><w:t>listed</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>""".encode("utf-8")
+
+    transformed = etree.fromstring(_pre_process_reject_tracked_changes(content))
+
+    # Formatting-change records survive untouched ...
+    assert transformed.findall(f".//{W}pPrChange")
+    assert transformed.findall(f".//{W}rPrChange")
+    # ... while the current formatting and list membership are retained.
+    assert transformed.findall(f".//{W}pStyle")
+    assert transformed.findall(f".//{W}b")
+    numbering = transformed.findall(f".//{W}numId")
+    assert len(numbering) == 1 and numbering[0].attrib[W + "val"] == "9"
+    # The deleted paragraph-mark revision is resolved (marker removed, the two
+    # paragraphs remain separate); no content-level revision elements remain.
+    assert transformed.findall(f".//{W}del") == []
+    assert transformed.findall(f".//{W}ins") == []
+
+
+def test_pre_process_docx_only_rejects_revisions_when_requested() -> None:
+    body = _paragraph(_text("stable ") + _revised_run("gone", "ins"))
+    stream = _docx(body)
+
+    default_archive = zipfile.ZipFile(pre_process_docx(stream))
+    default_document = default_archive.read("word/document.xml").decode()
+    assert "<w:ins" in default_document
+
+    rejected_archive = zipfile.ZipFile(
+        pre_process_docx(_docx(body), reject_tracked_changes=True)
+    )
+    rejected_document = rejected_archive.read("word/document.xml").decode()
+    assert "<w:ins" not in rejected_document
+    # Other parts keep their ordinary processing (scope is the main document).
+    assert "gone" not in rejected_document
 
 
 if __name__ == "__main__":
