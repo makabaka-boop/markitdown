@@ -1357,6 +1357,231 @@ class TestPdfMemoryOptimization:
             )
 
 
+# Review annotation extraction (opt-in via pdf_extract_annotations=True)
+
+
+ANNOTATED_PDF_PATH = os.path.join(TEST_FILES_DIR, "pdf_annotations.pdf")
+
+
+@pytest.fixture
+def annotated_pdf_path():
+    if not os.path.exists(ANNOTATED_PDF_PATH):
+        pytest.skip(f"Test file not found: {ANNOTATED_PDF_PATH}")
+    return ANNOTATED_PDF_PATH
+
+
+class TestPdfAnnotationExtraction:
+    """Notes, highlights, and threaded replies from reviewed PDFs."""
+
+    @pytest.fixture
+    def markitdown(self):
+        return MarkItDown()
+
+    def test_annotations_disabled_by_default(self, markitdown, annotated_pdf_path):
+        """Without the option the output is unchanged and no section appears."""
+        result = markitdown.convert(annotated_pdf_path)
+        assert "## Annotations" not in result.text_content
+
+        result_false = markitdown.convert(
+            annotated_pdf_path, pdf_extract_annotations=False
+        )
+        assert result.text_content == result_false.text_content
+
+    def test_body_unchanged_when_enabled(self, markitdown, annotated_pdf_path):
+        """The body precedes the section and is identical to the default run."""
+        default = markitdown.convert(annotated_pdf_path).text_content
+        enabled = markitdown.convert(
+            annotated_pdf_path, pdf_extract_annotations=True
+        ).text_content
+
+        assert enabled.endswith("## Annotations") is False
+        assert enabled.startswith(default.rstrip())
+        # Body text is fully preserved.
+        assert "Introduction to Distributed Systems" in enabled
+        assert "Replication and Consistency" in enabled
+
+    def test_no_annotations_adds_no_section(self, markitdown):
+        """A PDF without annotations gains no section even when enabled."""
+        pdf_path = os.path.join(TEST_FILES_DIR, "test.pdf")
+        if not os.path.exists(pdf_path):
+            pytest.skip(f"Test file not found: {pdf_path}")
+
+        result = markitdown.convert(pdf_path, pdf_extract_annotations=True)
+        assert "## Annotations" not in result.text_content
+
+    def test_section_is_appended_after_body(self, markitdown, annotated_pdf_path):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        body_pos = result.text_content.index("nodes to agree on a single value")
+        section_pos = result.text_content.index("## Annotations")
+        assert body_pos < section_pos
+
+    def test_page_headings_in_order(self, markitdown, annotated_pdf_path):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        page1 = section.index("### Page 1")
+        page2 = section.index("### Page 2")
+        assert 0 < page1 < page2
+
+    def test_note_preserves_author_and_multiline_text(
+        self, markitdown, annotated_pdf_path
+    ):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        assert "- **Note — Alice Reviewer**" in section
+        # Multi-line comment keeps both lines, in order.
+        line1 = section.index("Please clarify the failure model.")
+        line2 = section.index("Which faults are Byzantine?")
+        assert line1 < line2
+        assert section[line1:line2].count("\n") == 1
+
+    def test_replies_follow_parent_with_hierarchy_and_are_emitted_once(
+        self, markitdown, annotated_pdf_path
+    ):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        lines = result.text_content.split("\n")
+        root_idx = next(
+            i for i, line in enumerate(lines) if line == "- **Note — Alice Reviewer**"
+        )
+        reply_idx = next(
+            i for i, line in enumerate(lines) if line == "  - **Reply — Charlie**"
+        )
+        nested_idx = next(
+            i
+            for i, line in enumerate(lines)
+            if line == "    - **Reply — Alice Reviewer**"
+        )
+        assert root_idx < reply_idx < nested_idx
+
+        # Each reply is rendered exactly once (no duplicated threads).
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        assert section.count("Crash faults only.") == 1
+        assert section.count("We exclude Byzantine nodes here.") == 1
+        assert section.count("Agreed; I will spell this out.") == 1
+        assert section.count("**Reply — Charlie**") == 1
+        assert section.count("**Reply — Eve**") == 1
+
+    def test_orphan_reply_is_rendered_independently(
+        self, markitdown, annotated_pdf_path
+    ):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        lines = result.text_content.split("\n")
+        # Top-level (unindented) note, despite carrying an IRT reference.
+        orphan_idx = next(
+            i for i, line in enumerate(lines) if line == "- **Note — Olivia Orphan**"
+        )
+        assert "My parent annotation went missing." in lines[orphan_idx + 1]
+        # It belongs to the page 1 group (before the page 2 heading).
+        page2_idx = next(i for i, line in enumerate(lines) if line == "### Page 2")
+        assert orphan_idx < page2_idx
+
+    def test_highlight_quotes_selection_and_comment(
+        self, markitdown, annotated_pdf_path
+    ):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        header = section.index("- **Highlight — Bob**")
+        quote = section.index("> collection of independent computers", header)
+        comment = section.index("Cite the textbook definition for this claim.", quote)
+        assert header < quote < comment
+
+    def test_highlight_without_comment_keeps_discontinuous_selection_only(
+        self, markitdown, annotated_pdf_path
+    ):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        # Both selected fragments are quoted on adjacent blockquote lines...
+        assert (
+            "> appears to its users as a single coherent system.\n"
+            "  > transparency, scalability, and reliability."
+        ) in section
+        # ...and the words lying between the two selections are not quoted.
+        second_block = section.index(
+            "> appears to its users as a single coherent system."
+        )
+        end = section.index("transparency, scalability, and reliability.", second_block)
+        assert "The key goals are" not in section[second_block:end]
+        # The highlight with no comment text is still present (twice for Bob).
+        assert section.count("- **Highlight — Bob**") == 2
+
+    def test_highlight_preserves_cross_line_selection(
+        self, markitdown, annotated_pdf_path
+    ):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        assert (
+            "> Consensus protocols allow\n" "  > nodes to agree on a single value"
+        ) in section
+
+    def test_malformed_quadpoints_fall_back_to_rect(
+        self, markitdown, annotated_pdf_path
+    ):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        assert "- **Highlight — Dana**" in section
+        assert "> single coherent system." in section
+        assert "QuadPoints are malformed on purpose." in section
+
+    def test_empty_annotations_are_not_emitted(self, markitdown, annotated_pdf_path):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        assert "Nobody" not in section
+        # No content-less bullets.
+        for line in section.split("\n"):
+            assert line.strip() not in ("- **Note**", "- **Highlight**")
+
+    def test_corrupt_annotation_does_not_break_body_or_others(
+        self, markitdown, annotated_pdf_path
+    ):
+        # The fixture embeds an unresolvable annotation reference (9998 0 R).
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        expected = [
+            "Note — Alice Reviewer",
+            "Reply — Charlie",
+            "Reply — Alice Reviewer",
+            "Highlight — Bob",
+            "Highlight — Carol",
+            "Note — Olivia Orphan",
+            "Highlight — Dana",
+            "Note — Dana",
+            "Reply — Eve",
+        ]
+        for marker in expected:
+            assert (
+                marker in section
+            ), f"Missing annotation despite corrupt entry: {marker}"
+
+    def test_independent_annotations_follow_array_order(
+        self, markitdown, annotated_pdf_path
+    ):
+        result = markitdown.convert(annotated_pdf_path, pdf_extract_annotations=True)
+        section = result.text_content[result.text_content.index("## Annotations") :]
+        page1 = section[: section.index("### Page 2")]
+        positions = [
+            page1.find("**Note — Alice Reviewer**"),
+            page1.find("> collection of independent computers"),
+            page1.find("> appears to its users as a single coherent system."),
+            page1.find("> Consensus protocols allow"),
+            page1.find("**Note — Olivia Orphan**"),
+            page1.find("**Highlight — Dana**"),
+        ]
+        assert all(pos >= 0 for pos in positions)
+        assert positions == sorted(positions)
+
+    def test_form_pdf_annotations_pass_coexists_with_tables(
+        self, markitdown, pdf_activity
+    ):
+        """Enabling annotations must not disturb form/table extraction."""
+        pdf_path = os.path.join(TEST_FILES_DIR, "pdf_cleanup_form.pdf")
+        if not os.path.exists(pdf_path):
+            pytest.skip(f"Test file not found: {pdf_path}")
+        result = markitdown.convert(pdf_path, pdf_extract_annotations=True)
+        assert "ZAVA AUTO REPAIR" in result.text_content
+        assert "|" in result.text_content
+        # The cleanup fixture has no annotations: no section is appended.
+        assert "## Annotations" not in result.text_content
+
+
 # Conversion regressions
 
 skip_remote = (

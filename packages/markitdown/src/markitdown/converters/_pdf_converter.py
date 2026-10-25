@@ -62,7 +62,9 @@ _dependency_exc_info = None
 try:
     import pdfminer
     import pdfminer.high_level
+    import pdfminer.pdftypes
     import pdfplumber
+    import pdfplumber.utils
 except ImportError:
     _dependency_exc_info = sys.exc_info()
 
@@ -492,11 +494,386 @@ def _extract_tables_from_words(page: Any) -> list[list[list[str]]]:
     return [table_rows]
 
 
+# ---------------------------------------------------------------------------
+# Annotation extraction (opt-in via pdf_extract_annotations=True)
+# ---------------------------------------------------------------------------
+
+ANNOTATIONS_HEADING = "## Annotations"
+
+# Markup subtypes that carry review information. Popups and links are ignored.
+_ANNOT_SUBTYPE_NOTE = "Text"
+_ANNOT_SUBTYPE_HIGHLIGHT = "Highlight"
+_ANNOT_TYPE_LABELS = {
+    _ANNOT_SUBTYPE_NOTE: "Note",
+    _ANNOT_SUBTYPE_HIGHLIGHT: "Highlight",
+}
+
+# Padding (in PDF points) around a highlight quad when matching characters.
+# Zero padding clips glyph edges; more than ~1pt starts pulling in text from
+# neighbouring lines, which must never leak into a quoted selection.
+_ANNOT_QUAD_PADDING = 1.0
+# Two highlight quads whose vertical centres are within this distance are
+# considered fragments of the same visual line (joined with a space);
+# otherwise they represent different lines (joined with a newline).
+_ANNOT_SAME_LINE_TOLERANCE = 4.0
+
+
+def _decode_pdf_text_string(value: Any) -> str:
+    """Decode a PDF text string (``Contents``/``T``) and normalize newlines."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        if value.startswith((b"\xfe\xff", b"\xff\xfe")):
+            # UTF-16 with a byte-order mark, as written by most PDF producers.
+            value = value.decode("utf-16", errors="replace")
+        else:
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError:
+                # PDFDocEncoding is close enough to Latin-1 for retrieval.
+                value = value.decode("latin-1")
+    text = str(value)
+    # PDF line endings may be CR, LF, or CRLF.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _pdf_name(value: Any) -> str:
+    """Return the plain name for a pdfminer name literal (``Subtype`` etc.)."""
+    name = getattr(value, "name", value)
+    return str(name) if name is not None else ""
+
+
+def _clean_multiline_text(text: str) -> str:
+    """Trim surrounding whitespace per line while preserving line breaks."""
+    return "\n".join(line.strip() for line in text.split("\n")).strip()
+
+
+def _rotate_pdf_point(
+    x: float, y: float, rotation: int, width: float, height: float
+) -> tuple[float, float]:
+    """Rotate a point from raw PDF space the same way pdfplumber rotates Rects."""
+    turns = rotation // 90
+    for i in range(turns):
+        comp = width if i == turns % 2 else height
+        x, y = y, comp - x
+    return x, y
+
+
+def _pdf_rect_to_bbox(points: list[tuple[float, float]], page: Any) -> tuple | None:
+    """Convert raw PDF-space polygon points to a top-based pdfplumber bbox."""
+    try:
+        rotated = [
+            _rotate_pdf_point(x, y, page.rotation, page.width, page.height)
+            for x, y in points
+        ]
+    except Exception:
+        return None
+    if not rotated:
+        return None
+    x0 = min(x for x, _ in rotated)
+    x1 = max(x for x, _ in rotated)
+    y0 = min(y for _, y in rotated)
+    y1 = max(y for _, y in rotated)
+    # Rotated points are still bottom-up; invert against the page height.
+    return (x0, page.height - y1, x1, page.height - y0)
+
+
+def _highlight_bboxes(raw_annot: dict, page: Any) -> list[tuple]:
+    """Return the top-based bbox of each quad in a highlight annotation.
+
+    Falls back to the annotation rectangle when ``QuadPoints`` is missing or
+    malformed.
+    """
+    quadpoints = raw_annot.get("QuadPoints")
+    bboxes: list[tuple] = []
+    if isinstance(quadpoints, list):
+        for i in range(0, len(quadpoints) - 7, 8):
+            group = quadpoints[i : i + 8]
+            points = [(group[j], group[j + 1]) for j in (0, 2, 4, 6)]
+            if not all(isinstance(coord, (int, float)) for coord in group):
+                continue
+            bbox = _pdf_rect_to_bbox(points, page)
+            if bbox is not None:
+                bboxes.append(bbox)
+
+    if not bboxes:
+        rect = raw_annot.get("Rect")
+        if isinstance(rect, list) and len(rect) == 4:
+            points = [
+                (rect[0], rect[1]),
+                (rect[2], rect[1]),
+                (rect[0], rect[3]),
+                (rect[2], rect[3]),
+            ]
+            if all(isinstance(coord, (int, float)) for coord in rect):
+                bbox = _pdf_rect_to_bbox(points, page)
+                if bbox is not None:
+                    bboxes.append(bbox)
+    return bboxes
+
+
+def _extract_highlight_quote(raw_annot: dict, page: Any) -> str:
+    """Quote the text actually covered by a highlight annotation.
+
+    Each quad is extracted independently so that text lying *between*
+    discontinuous selections is never included. Characters shared by
+    overlapping quads are only emitted once. Quads on different lines keep
+    their line break; fragments on the same line are joined with a space.
+    """
+    bboxes = _highlight_bboxes(raw_annot, page)
+    if not bboxes:
+        return ""
+
+    try:
+        chars = page.chars
+    except Exception:
+        return ""
+
+    fragments: list[tuple[float, float, str]] = []
+    seen_chars: set[int] = set()
+    for x0, top, x1, bottom in bboxes:
+        selected = []
+        for char in chars:
+            char_id = id(char)
+            if char_id in seen_chars:
+                continue
+            try:
+                inside = (
+                    char["x0"] >= x0 - _ANNOT_QUAD_PADDING
+                    and char["x1"] <= x1 + _ANNOT_QUAD_PADDING
+                    and char["top"] >= top - _ANNOT_QUAD_PADDING
+                    and char["bottom"] <= bottom + _ANNOT_QUAD_PADDING
+                )
+            except (KeyError, TypeError):
+                continue
+            if inside:
+                selected.append(char)
+                seen_chars.add(char_id)
+        if not selected:
+            continue
+        try:
+            text = pdfplumber.utils.extract_text(
+                selected, x_tolerance=1.5, y_tolerance=3
+            )
+        except Exception:
+            continue
+        text = text.strip()
+        if text:
+            mean_top = sum(char["top"] for char in selected) / len(selected)
+            mean_x = sum(char["x0"] for char in selected) / len(selected)
+            fragments.append((mean_top, mean_x, text))
+
+    if not fragments:
+        return ""
+
+    fragments.sort(key=lambda fragment: (fragment[0], fragment[1]))
+    lines: list[str] = []
+    previous_top: float | None = None
+    for mean_top, _mean_x, text in fragments:
+        if (
+            previous_top is not None
+            and abs(mean_top - previous_top) <= _ANNOT_SAME_LINE_TOLERANCE
+        ):
+            lines[-1] = f"{lines[-1]} {text}"
+        else:
+            lines.append(text)
+        previous_top = mean_top
+    return "\n".join(lines)
+
+
+def _iter_raw_annotations(page_obj: Any) -> list[tuple[int, Any, dict]]:
+    """Return ``(array_index, objid_or_None, raw_dict)`` for a page.
+
+    Entries that cannot be resolved are dropped here; a single bad reference
+    must not prevent the remaining annotations from being read.
+    """
+    try:
+        raw_annots = pdfminer.pdftypes.resolve1(page_obj.annots)
+    except Exception:
+        return []
+    if not isinstance(raw_annots, list):
+        return []
+
+    annotations: list[tuple[int, Any, dict]] = []
+    for order, reference in enumerate(raw_annots):
+        try:
+            if isinstance(reference, pdfminer.pdftypes.PDFObjRef):
+                objid: Any = reference.objid
+                raw = pdfminer.pdftypes.resolve1(reference)
+            else:
+                objid = None
+                raw = reference
+        except Exception:
+            continue
+        if isinstance(raw, dict):
+            annotations.append((order, objid, raw))
+    return annotations
+
+
+def _build_annotation_record(
+    page: Any, page_number: int, order: int, objid: Any, raw: dict
+) -> dict | None:
+    """Build one annotation record, or ``None`` if it carries no content."""
+    try:
+        subtype = _pdf_name(raw.get("Subtype"))
+        if subtype not in _ANNOT_TYPE_LABELS:
+            return None
+
+        author = _clean_multiline_text(_decode_pdf_text_string(raw.get("T")))
+        content = _clean_multiline_text(_decode_pdf_text_string(raw.get("Contents")))
+
+        quote = ""
+        if subtype == _ANNOT_SUBTYPE_HIGHLIGHT:
+            quote = _extract_highlight_quote(raw, page)
+
+        # Notes need comment text; highlights are kept whenever they quote
+        # selected text, even with no comment of their own.
+        if subtype == _ANNOT_SUBTYPE_NOTE and not content:
+            return None
+        if subtype == _ANNOT_SUBTYPE_HIGHLIGHT and not content and not quote:
+            return None
+
+        parent: Any = None
+        irt = raw.get("IRT")
+        if isinstance(irt, pdfminer.pdftypes.PDFObjRef):
+            parent = irt.objid
+        elif isinstance(irt, dict):
+            parent = f"inline-{id(irt)}"
+
+        if objid is None:
+            key: Any = f"inline-{id(raw)}"
+        else:
+            key = objid
+
+        return {
+            "key": key,
+            "raw_key": id(raw),
+            "page": page_number,
+            "order": order,
+            "subtype": subtype,
+            "author": author,
+            "content": content,
+            "quote": quote,
+            "parent": parent,
+        }
+    except Exception:
+        # Never let a single malformed annotation break the others.
+        return None
+
+
+def _render_annotation_thread(
+    record: dict,
+    children_by_parent: dict,
+    emitted: set,
+    depth: int,
+) -> list[str]:
+    """Render an annotation and its reply subtree, each entry exactly once."""
+    if record["key"] in emitted:
+        return []
+    emitted.add(record["key"])
+
+    indent = "  " * depth
+    body_indent = indent + "  "
+    label = "Reply" if depth > 0 else _ANNOT_TYPE_LABELS[record["subtype"]]
+    if record["author"]:
+        label = f"{label} — {record['author']}"
+
+    lines = [f"{indent}- **{label}**"]
+    if record["quote"]:
+        for quote_line in record["quote"].split("\n"):
+            lines.append(f"{body_indent}> {quote_line}")
+    if record["content"]:
+        for content_line in record["content"].split("\n"):
+            lines.append(f"{body_indent}{content_line}")
+
+    for child in children_by_parent.get(record["key"], []):
+        lines.append("")
+        lines.extend(
+            _render_annotation_thread(child, children_by_parent, emitted, depth + 1)
+        )
+    return lines
+
+
+def _extract_pdf_annotations(pdf_bytes: BinaryIO) -> str | None:
+    """Build the annotations section for a PDF, or ``None`` if there is none.
+
+    Independent annotations are ordered by page and by their position in the
+    page's annotation array. Replies are nested under their parent (via the
+    ``/IRT`` reference) and emitted once; replies whose parent is missing are
+    rendered as independent annotations.
+    """
+    records: list[dict] = []
+    with pdfplumber.open(pdf_bytes) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            page_number = page_idx + 1
+            try:
+                for order, objid, raw in _iter_raw_annotations(page.page_obj):
+                    record = _build_annotation_record(
+                        page, page_number, order, objid, raw
+                    )
+                    if record is not None:
+                        records.append(record)
+            except Exception:
+                # A broken page must not take down annotation extraction.
+                continue
+            finally:
+                page.close()
+
+    if not records:
+        return None
+
+    by_key = {record["key"]: record for record in records}
+    # Also allow inline (non-indirect) parents to be matched by object id.
+    for record in records:
+        by_key[f"inline-{record['raw_key']}"] = record
+
+    children_by_parent: dict = {}
+    roots: list[dict] = []
+    for record in records:
+        parent = record["parent"]
+        if parent is not None and parent in by_key and parent != record["key"]:
+            children_by_parent.setdefault(parent, []).append(record)
+        else:
+            # Independent annotation, or a reply whose parent is missing.
+            roots.append(record)
+
+    emitted: set = set()
+    lines = [ANNOTATIONS_HEADING, ""]
+    for page_number in sorted({record["page"] for record in roots}):
+        page_roots = [
+            record
+            for record in roots
+            if record["page"] == page_number and record["key"] not in emitted
+        ]
+        if not page_roots:
+            continue
+        lines.append(f"### Page {page_number}")
+        lines.append("")
+        for record in page_roots:
+            lines.extend(
+                _render_annotation_thread(record, children_by_parent, emitted, 0)
+            )
+            lines.append("")
+
+    # Defensive fallback for anything not reached (e.g. a reply cycle).
+    leftovers = [record for record in records if record["key"] not in emitted]
+    for record in sorted(leftovers, key=lambda r: (r["page"], r["order"])):
+        lines.extend(_render_annotation_thread(record, children_by_parent, emitted, 0))
+        lines.append("")
+
+    section = "\n".join(lines).strip()
+    return section or None
+
+
 class PdfConverter(DocumentConverter):
     """
     Converts PDFs to Markdown.
     Supports extracting tables into aligned Markdown format (via pdfplumber).
     Falls back to pdfminer if pdfplumber is missing or fails.
+
+    Pass ``pdf_extract_annotations=True`` to additionally extract review
+    annotations (sticky notes, highlights, and threaded replies). They are
+    appended in a dedicated section after the document body.
     """
 
     def accepts(
@@ -585,5 +962,23 @@ class PdfConverter(DocumentConverter):
 
         # Post-process to merge MasterFormat-style partial numbering with following text
         markdown = _merge_partial_numbering_lines(markdown)
+
+        # Optional: append review annotations (notes, highlights, replies).
+        # Runs in a separate pass and after body post-processing so that the
+        # default output is byte-for-byte unchanged and annotation extraction
+        # can never affect body/table extraction or its fallbacks.
+        if kwargs.get("pdf_extract_annotations"):
+            annotation_section: str | None = None
+            try:
+                pdf_bytes.seek(0)
+                annotation_section = _extract_pdf_annotations(pdf_bytes)
+            except Exception:
+                annotation_section = None
+            if annotation_section:
+                markdown = (
+                    f"{markdown}\n\n{annotation_section}"
+                    if markdown.strip()
+                    else annotation_section
+                )
 
         return DocumentConverterResult(markdown=markdown)
